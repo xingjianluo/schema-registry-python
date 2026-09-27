@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from .migration import ConflictMode, MigrationError
 from .models import CompatibilityLevel
 from .service import (
     IncompatibleSchemaError,
@@ -48,6 +49,14 @@ def create_app(service: RegistryService | None = None) -> FastAPI:
     async def _not_found(request: Request, exc: KeyError):
         return JSONResponse(status_code=404,
                             content={"error": "NOT_FOUND", "message": str(exc)})
+
+    @app.exception_handler(MigrationError)
+    async def _migration_error(request: Request, exc: MigrationError):
+        status = 409 if exc.category == "IMPORT_CONFLICT" else 422
+        return JSONResponse(
+            status_code=status,
+            content={"error": exc.category, "message": str(exc)},
+        )
 
     @app.get("/")
     def read_root():
@@ -110,5 +119,42 @@ def create_app(service: RegistryService | None = None) -> FastAPI:
         return {"compatibility": record.level.value,
                 "effective_version": record.effective_version,
                 "changed_at": record.changed_at}
+
+    # -- migration ---------------------------------------------------------
+
+    @app.post("/migration/export")
+    def export_package(payload: dict | None = None):
+        subjects = None
+        if payload is not None:
+            subjects = payload.get("subjects")
+            if subjects is not None and (
+                    not isinstance(subjects, list) or not all(
+                        isinstance(s, str) and s for s in subjects)):
+                raise SchemaValidationError(
+                    "'subjects' must be a list of non-empty strings")
+        data = service.export_subjects(subjects)
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition":
+                     'attachment; filename="migration.json"'},
+        )
+
+    @app.post("/migration/import")
+    async def import_package(request: Request):
+        mode_value = request.query_params.get("mode", "REJECT")
+        try:
+            mode = ConflictMode(mode_value)
+        except ValueError:
+            raise SchemaValidationError(
+                f"unknown conflict mode {mode_value!r}; "
+                f"expected REJECT or MERGE")
+        data = await request.body()
+        results = service.import_package(data, mode)
+        return {"imported": [
+            {"subject": r.subject, "created": r.created,
+             "added_versions": list(r.added_versions),
+             "skipped_versions": list(r.skipped_versions)}
+            for r in results]}
 
     return app
