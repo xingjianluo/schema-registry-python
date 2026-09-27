@@ -4,6 +4,11 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .migration import (
+    BundleInconsistentError,
+    BundleMalformedError,
+    ImportConflictError,
+)
 from .models import CompatibilityLevel
 from .service import (
     IncompatibleSchemaError,
@@ -48,6 +53,22 @@ def create_app(service: RegistryService | None = None) -> FastAPI:
     async def _not_found(request: Request, exc: KeyError):
         return JSONResponse(status_code=404,
                             content={"error": "NOT_FOUND", "message": str(exc)})
+
+    @app.exception_handler(BundleMalformedError)
+    async def _bundle_malformed(request: Request, exc: BundleMalformedError):
+        return JSONResponse(status_code=422,
+                            content={"error": exc.code, "message": str(exc)})
+
+    @app.exception_handler(BundleInconsistentError)
+    async def _bundle_inconsistent(request: Request,
+                                   exc: BundleInconsistentError):
+        return JSONResponse(status_code=422,
+                            content={"error": exc.code, "message": str(exc)})
+
+    @app.exception_handler(ImportConflictError)
+    async def _import_conflict(request: Request, exc: ImportConflictError):
+        return JSONResponse(status_code=409,
+                            content={"error": exc.code, "message": str(exc)})
 
     @app.get("/")
     def read_root():
@@ -110,5 +131,32 @@ def create_app(service: RegistryService | None = None) -> FastAPI:
         return {"compatibility": record.level.value,
                 "effective_version": record.effective_version,
                 "changed_at": record.changed_at}
+
+    @app.post("/migration/export")
+    def export(payload: dict):
+        subjects = payload.get("subjects")
+        if not isinstance(subjects, list) or not all(
+                isinstance(s, str) for s in subjects):
+            raise SchemaValidationError(
+                "body must contain a 'subjects' list of strings")
+        return service.export_subjects(subjects)
+
+    @app.post("/migration/import")
+    def import_(payload: dict):
+        bundle = payload.get("bundle")
+        if not isinstance(bundle, dict):
+            raise SchemaValidationError("body must contain a 'bundle' object")
+        mode = payload.get("on_conflict", "reject")
+        summary = service.import_bundle(bundle, on_conflict=mode)
+        return {
+            "imported_versions": summary.imported_versions,
+            "subjects": [
+                {"name": p.name,
+                 "new_versions": len(p.new_versions),
+                 "new_policies": len(p.new_policies),
+                 "already_present": p.already_present}
+                for p in summary.plans
+            ],
+        }
 
     return app

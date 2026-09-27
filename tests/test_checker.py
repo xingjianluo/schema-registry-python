@@ -1,7 +1,6 @@
 """Tests for compatibility rules and error classification."""
 from __future__ import annotations
 
-
 from app.checker import check_compatibility, validate_schema
 from app.models import CompatibilityLevel, IncompatibilityCode
 

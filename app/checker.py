@@ -17,7 +17,21 @@ This module is pure: it never mutates its arguments and never stores state.
 """
 from __future__ import annotations
 
-from .models import CompatibilityLevel, CompatibilityReport, Incompatibility, IncompatibilityCode
+import hashlib
+import json
+
+from .models import (
+    CompatibilityLevel,
+    CompatibilityReport,
+    Incompatibility,
+    IncompatibilityCode,
+)
+
+
+def canonical_schema_id(schema: dict) -> str:
+    """Stable id: identical schema documents share an id."""
+    blob = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 PRIMITIVES = {"null", "boolean", "int", "long", "float", "double", "bytes", "string"}
 

@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .config import DEFAULT_COMPATIBILITY
 from .models import CompatibilityLevel, PolicyRecord, RegisteredSchema
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class SchemaStore:
@@ -105,3 +105,38 @@ class SchemaStore:
     def list_policies(self, subject: str) -> list[PolicyRecord]:
         with self._lock:
             return list(self._policies.get(subject, []))
+
+    # -- migration primitives ----------------------------------------------
+
+    def snapshot(self, subjects: list[str] | None = None,
+                 ) -> dict[str, tuple[list[RegisteredSchema],
+                                      list[PolicyRecord]]]:
+        """Point-in-time copy of versions + policy history.
+
+        With *subjects* None, covers every known subject (including ones
+        that only have a policy history).  One lock hold => consistent cut.
+        """
+        with self._lock:
+            names = (sorted(set(self._subjects) | set(self._policies))
+                     if subjects is None else subjects)
+            return {
+                name: (list(self._subjects.get(name, [])),
+                       list(self._policies.get(name, [])))
+                for name in names
+            }
+
+    def apply_import(self,
+                     plans: list[tuple[str,
+                                       list[RegisteredSchema],
+                                       list[PolicyRecord]]]) -> None:
+        """Append planned versions/policy records in one critical section.
+
+        Only ever appends, so readers blocked on the lock see either the
+        full pre-import or the full post-import state.
+        """
+        with self._lock:
+            for name, new_versions, new_policies in plans:
+                if new_versions:
+                    self._subjects.setdefault(name, []).extend(new_versions)
+                if new_policies:
+                    self._policies.setdefault(name, []).extend(new_policies)

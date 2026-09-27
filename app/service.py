@@ -1,13 +1,19 @@
 """Application service: orchestrates storage, checker and cache."""
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import threading
+from datetime import UTC, datetime
 
 from .cache import ConclusionCache
-from .checker import check_compatibility, validate_schema
+from .checker import canonical_schema_id, check_compatibility, validate_schema
+from .migration import (
+    ConflictMode,
+    ImportSummary,
+    build_bundle,
+    plan_import,
+    validate_bundle,
+)
 from .models import (
     CompatibilityLevel,
     CompatibilityReport,
@@ -32,10 +38,12 @@ class IncompatibleSchemaError(ValueError):
         super().__init__(f"schema rejected under {report.level.value}: {codes}")
 
 
-def canonical_schema_id(schema: dict) -> str:
-    """Stable id: identical schema documents share an id."""
-    blob = json.dumps(schema, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+__all__ = [
+    "IncompatibleSchemaError",
+    "RegistryService",
+    "SchemaValidationError",
+    "canonical_schema_id",
+]
 
 
 class RegistryService:
@@ -112,12 +120,16 @@ class RegistryService:
     # -- policy ------------------------------------------------------------
 
     def set_policy(self, subject: str, level: CompatibilityLevel) -> PolicyRecord:
-        record = self.store.set_policy(subject, level)
-        # Old conclusions were derived under the old policy: drop them.
-        self.cache.invalidate_subject(subject)
-        latest = self.store.latest_version(subject)
-        if latest is not None:
-            self.cache.note_version(subject, latest.version)
+        # Serialized with registrations and imports so a policy change can
+        # never interleave with an import's check-then-apply and silently
+        # rewrite the policy that governs a just-imported version.
+        with self._register_lock:
+            record = self.store.set_policy(subject, level)
+            # Old conclusions were derived under the old policy: drop them.
+            self.cache.invalidate_subject(subject)
+            latest = self.store.latest_version(subject)
+            if latest is not None:
+                self.cache.note_version(subject, latest.version)
         logger.info("policy changed subject=%s level=%s effective_from=v%s",
                     subject, level.value, record.effective_version)
         return record
@@ -145,3 +157,68 @@ class RegistryService:
             "recheck subject=%s version=%d level_at_then=%s compatible=%s",
             subject, version, policy.level.value, report.compatible)
         return report
+
+    # -- migration -----------------------------------------------------------
+
+    def export_subjects(self, subjects: list[str]) -> dict:
+        """Snapshot *subjects* into a self-contained, verifiable bundle.
+
+        The snapshot is taken under the store lock, so the bundle is a
+        consistent point-in-time cut; concurrent registrations either
+        land entirely before or entirely after it.
+        """
+        if not subjects:
+            raise SchemaValidationError("no subjects given to export")
+        snapshot = self.store.snapshot(list(subjects))
+        missing = [n for n in subjects
+                   if not snapshot[n][0] and not snapshot[n][1]]
+        if missing:
+            raise KeyError(f"unknown subjects: {', '.join(sorted(missing))}")
+        bundle = build_bundle(
+            snapshot, datetime.now(UTC).isoformat())
+        logger.info(
+            "export subjects=%s versions=%s",
+            sorted(subjects),
+            {n: len(snapshot[n][0]) for n in subjects})
+        return bundle
+
+    def import_bundle(self, bundle: dict,
+                      on_conflict: str = "reject") -> ImportSummary:
+        """Import a bundle atomically.
+
+        Phase 1 (validate + plan) runs without mutating anything; any
+        malformed/inconsistent/conflicting input aborts before phase 2,
+        so there is never a half-imported state to roll back.  Phase 2
+        applies all appends in one store critical section.  The whole
+        check-then-apply is serialized against registrations and policy
+        changes via the register lock, while plain readers only ever
+        observe the state before or after the short apply.
+        """
+        entries = validate_bundle(bundle)  # raises before any mutation
+        try:
+            mode = ConflictMode(on_conflict)
+        except ValueError:
+            raise SchemaValidationError(
+                f"unknown on_conflict mode {on_conflict!r}; "
+                f"expected 'reject' or 'merge'")
+        with self._register_lock:
+            snapshot = self.store.snapshot([e["name"] for e in entries])
+            plans = plan_import(entries, snapshot, mode)
+            self.store.apply_import([
+                (p.name, list(p.new_versions), list(p.new_policies))
+                for p in plans
+            ])
+            for p in plans:
+                # Imported versions change what 'latest' means here.
+                self.cache.invalidate_subject(p.name)
+                latest = self.store.latest_version(p.name)
+                if latest is not None:
+                    self.cache.note_version(p.name, latest.version)
+        summary = ImportSummary(tuple(plans))
+        logger.info(
+            "import mode=%s subjects=%s imported_versions=%d already_present=%s",
+            mode.value,
+            {p.name: len(p.new_versions) for p in plans},
+            summary.imported_versions,
+            {p.name: p.already_present for p in plans if p.already_present})
+        return summary
