@@ -15,11 +15,20 @@ def _utcnow() -> str:
 class SchemaStore:
     """In-memory store. All mutating operations are serialized by one lock."""
 
-    def __init__(self) -> None:
+    def __init__(self,
+                 default_level: CompatibilityLevel = DEFAULT_COMPATIBILITY) -> None:
         self._lock = threading.RLock()
+        # Per-instance default policy.  It only governs subjects that have
+        # never had an explicit policy set; migration never relies on it for
+        # imported subjects, because bundles carry their own base policy.
+        self._default = default_level
         self._subjects: dict[str, list[RegisteredSchema]] = {}
         # policy history per subject, kept sorted by effective_version.
         self._policies: dict[str, list[PolicyRecord]] = {}
+
+    @property
+    def default_level(self) -> CompatibilityLevel:
+        return self._default
 
     # -- versions ----------------------------------------------------------
 
@@ -75,7 +84,7 @@ class SchemaStore:
             if history:
                 return history[-1]
             return PolicyRecord(
-                level=DEFAULT_COMPATIBILITY,
+                level=self._default,
                 effective_version=1,
                 changed_at=_utcnow(),
             )
@@ -97,7 +106,7 @@ class SchemaStore:
             if chosen is not None:
                 return chosen
             return PolicyRecord(
-                level=DEFAULT_COMPATIBILITY,
+                level=self._default,
                 effective_version=1,
                 changed_at=_utcnow(),
             )

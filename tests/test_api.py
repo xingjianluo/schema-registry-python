@@ -1,10 +1,15 @@
 """End-to-end HTTP tests."""
 from __future__ import annotations
 
+import copy
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import create_app
+from app.migration import seal_bundle
+from app.models import CompatibilityLevel
 from app.service import RegistryService
 
 V1 = {"type": "record", "name": "User", "fields": [
@@ -134,27 +139,89 @@ def test_http_import_conflict_409(client, judge):
     assert r.json()["error"] == "IMPORT_CONFLICT"
 
 
-def test_http_import_malformed_and_inconsistent_422(client, judge):
+def test_http_import_error_categories_422(client, judge):
     _seed(client)
     bundle = client.post("/migration/export",
                          json={"subjects": ["user"]}).json()
 
-    bad_structure = client.post("/migration/import",
-                                json={"bundle": {"format": "nope"}})
-    tampered = client.post("/migration/import", json={"bundle": {
-        **bundle, "subjects": [
-            {**bundle["subjects"][0],
-             "versions": [{**bundle["subjects"][0]["versions"][0],
-                           "schema_id": "0" * 16}
-                          ] + bundle["subjects"][0]["versions"][1:]}]}})
-    judge("http-import-422", {"cases": ["bad structure", "tampered id"]},
-          "structural -> BUNDLE_MALFORMED, contradiction -> "
-          "BUNDLE_INCONSISTENT, both 422",
-          {"structure": bad_structure.json(), "tampered": tampered.json()})
-    assert bad_structure.status_code == 422
-    assert bad_structure.json()["error"] == "BUNDLE_MALFORMED"
+    def _post(b):
+        return client.post("/migration/import",
+                           json={"bundle": b, "on_conflict": "reject"})
+
+    # 1) corrupt: hand-written object without an integrity envelope
+    no_envelope = _post({"format": "nope"})
+    # 2) corrupt: real package modified after export (digest mismatch)
+    tampered = _post({**bundle, "subjects": [
+        {**bundle["subjects"][0],
+         "versions": [{**bundle["subjects"][0]["versions"][0],
+                       "registered_at": "2000-01-01T00:00:00+00:00"}]
+                      + bundle["subjects"][0]["versions"][1:]}]})
+    # 3) corrupt: truncated raw document uploaded as a string
+    truncated = _post(json.dumps(bundle)[:150])
+    # 4) malformed: authentic envelope, wrong format
+    malformed = _post(seal_bundle({**bundle, "format": "other"}))
+    # 5) incomplete: authentic envelope, base policy missing
+    subj = {k: v for k, v in bundle["subjects"][0].items()
+            if k != "base_policy"}
+    incomplete = _post(seal_bundle(
+        {**bundle, "subjects": [subj]}))
+    # 6) inconsistent: authentic envelope, schema_id contradicts schema
+    bad_id = copy.deepcopy(bundle)
+    bad_id["subjects"][0]["versions"][0]["schema_id"] = "0" * 16
+    inconsistent = _post(seal_bundle(bad_id))
+
+    bodies = {
+        "no_envelope": no_envelope.json(), "tampered": tampered.json(),
+        "truncated": truncated.json(), "malformed": malformed.json(),
+        "incomplete": incomplete.json(), "inconsistent": inconsistent.json()}
+    judge("http-import-422",
+          {"cases": list(bodies)},
+          "corrupt (no envelope / tampered / truncated) -> BUNDLE_CORRUPT; "
+          "malformed -> BUNDLE_MALFORMED; missing data -> "
+          "BUNDLE_INCOMPLETE; contradiction -> BUNDLE_INCONSISTENT; all 422",
+          bodies)
+    assert no_envelope.status_code == 422
+    assert no_envelope.json()["error"] == "BUNDLE_CORRUPT"
     assert tampered.status_code == 422
-    assert tampered.json()["error"] == "BUNDLE_INCONSISTENT"
+    assert tampered.json()["error"] == "BUNDLE_CORRUPT"
+    assert truncated.status_code == 422
+    assert truncated.json()["error"] == "BUNDLE_CORRUPT"
+    assert malformed.json()["error"] == "BUNDLE_MALFORMED"
+    assert incomplete.json()["error"] == "BUNDLE_INCOMPLETE"
+    assert inconsistent.json()["error"] == "BUNDLE_INCONSISTENT"
+    for r in (no_envelope, tampered, truncated, malformed, incomplete,
+              inconsistent):
+        assert r.status_code == 422
+
+
+def test_http_import_across_different_default_policies(judge):
+    """HTTP end-to-end: a FORWARD-default source's subject imports into a
+    BACKWARD-default instance and keeps its FORWARD historical conclusion."""
+    src_app = create_app(RegistryService(
+        default_level=CompatibilityLevel.FORWARD))
+    src = TestClient(src_app)
+    v_required_add = {"type": "record", "name": "User", "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "nick", "type": "string"}]}  # required field: FORWARD-only
+    src.post("/subjects/user/versions", json={"schema": V1})
+    accepted = src.post("/subjects/user/versions",
+                        json={"schema": v_required_add})
+    assert accepted.status_code == 200
+    bundle = src.post("/migration/export",
+                      json={"subjects": ["user"]}).json()
+
+    tgt = TestClient(create_app(RegistryService(
+        default_level=CompatibilityLevel.BACKWARD)))
+    imported = tgt.post("/migration/import",
+                        json={"bundle": bundle, "on_conflict": "reject"})
+    recheck = tgt.get("/subjects/user/compatibility/recheck/2").json()
+    judge("http-cross-default", {"src": "FORWARD", "tgt": "BACKWARD"},
+          "import succeeds and v2 keeps FORWARD compatibility on target",
+          {"import": imported.json(), "recheck": recheck})
+    assert imported.status_code == 200
+    assert imported.json()["imported_versions"] == 2
+    assert recheck["is_compatible"] is True
+    assert recheck["compatibility"] == "FORWARD"
 
 
 def test_http_export_unknown_subject_404(client):

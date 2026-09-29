@@ -48,8 +48,12 @@ __all__ = [
 
 class RegistryService:
     def __init__(self, store: SchemaStore | None = None,
-                 cache: ConclusionCache | None = None) -> None:
-        self.store = store if store is not None else SchemaStore()
+                 cache: ConclusionCache | None = None,
+                 default_level: CompatibilityLevel | None = None) -> None:
+        if store is None:
+            store = SchemaStore(default_level) if default_level is not None \
+                else SchemaStore()
+        self.store = store
         self.cache = cache if cache is not None else ConclusionCache()
         # Serializes check-then-register so concurrent registrations of the
         # same subject always observe dense, unique version numbers.
@@ -175,7 +179,8 @@ class RegistryService:
         if missing:
             raise KeyError(f"unknown subjects: {', '.join(sorted(missing))}")
         bundle = build_bundle(
-            snapshot, datetime.now(UTC).isoformat())
+            snapshot, datetime.now(UTC).isoformat(),
+            default_level=self.store.default_level)
         logger.info(
             "export subjects=%s versions=%s",
             sorted(subjects),
@@ -203,7 +208,8 @@ class RegistryService:
                 f"expected 'reject' or 'merge'")
         with self._register_lock:
             snapshot = self.store.snapshot([e["name"] for e in entries])
-            plans = plan_import(entries, snapshot, mode)
+            plans = plan_import(entries, snapshot, mode,
+                                target_default=self.store.default_level)
             self.store.apply_import([
                 (p.name, list(p.new_versions), list(p.new_policies))
                 for p in plans
