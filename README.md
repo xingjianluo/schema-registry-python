@@ -15,8 +15,9 @@
 - 结论缓存：登记新版本或切换策略后相关缓存立即失效/被判为陈旧，
   缓存结论不会与最新登记版本矛盾。
 - 并发安全：注册的"检查—写入"由单把锁串行化。
-- 离线迁移：把一个/一批主体导出为自校验迁移包，导入到另一个本地实例；
-  支持"冲突整体拒绝"与"只合并缺失版本"两种模式，导入是原子的。
+- 离线迁移：把一个/一批主体导出为带 SHA-256 完整性签名的自校验迁移包，
+  导入到另一个本地实例；策略历史自带基线，**导入结论与导入方默认策略无关**；
+  支持"冲突整体拒绝"与"只合并缺失版本"两种模式，异常包分类拒绝且导入原子。
 
 ## 数据模型
 
@@ -131,16 +132,18 @@ Schema 使用 Avro 风格的 JSON 文档，顶层必须是 `record`：
 ## 离线迁移（导出 / 导入）
 
 用于本地实例之间的迁移与灾备：把测试环境积累的主体搬到空实例，或把两个
-实例的注册数据合并起来。
+实例的注册数据合并起来。**导入结果不依赖导入方自己的默认兼容策略**，也不
+信任未经完整性校验的包。
 
-### 迁移包内容
+### 迁移包为历史结论保存了什么
 
-`POST /migration/export` 产出一个自包含的 JSON 迁移包（bundle）：
+`POST /migration/export` 产出一个自包含、带签名的 JSON 迁移包（bundle，
+`format_version: 2`）：
 
 ```json
 {
   "format": "schema-registry-bundle",
-  "format_version": 1,
+  "format_version": 2,
   "exported_at": "2026-09-28T04:00:00+00:00",
   "subjects": [
     {
@@ -151,20 +154,65 @@ Schema 使用 Avro 风格的 JSON 文档，顶层必须是 `record`：
          "conclusion": {"compatible": true, "incompatibilities": []}}
       ],
       "policies": [
+        {"level": "BACKWARD", "effective_version": 1, "changed_at": "…"},
         {"level": "NONE", "effective_version": 3, "changed_at": "…"}
       ]
     }
-  ]
+  ],
+  "integrity": {"alg": "SHA-256", "sha256": "…64 位十六进制…"}
 }
 ```
 
 每个主体包含三部分，缺一不可：
 
 - **版本序列**：版本号、Schema 文档、`schema_id`、登记时间；
-- **策略历史**：每次策略变更的级别与 `effective_version`；
+- **完整策略历史**：每次策略变更的级别与 `effective_version`，**且始终带
+  一条 `effective_version=1` 的基线记录**。存储本身只记录显式变更，早期
+  版本的生效级别原本由"该实例的默认配置"隐含决定；导出时把它显式写进包，
+  导入后每个版本都能还原出**它在导出方登记时的策略**，与导入方实例的
+  `SCHEMA_REGISTRY_COMPATIBILITY` 完全无关。因此即使两边默认策略不同
+  （例如导出方默认 `FORWARD/NONE`、导入方默认 `BACKWARD`），主体也能整体
+  导入，且历史兼容结论与导出方逐条一致；
 - **逐版本派生事实**：该版本登记时的生效策略级别、按当时策略得到的
-  兼容结论。这两类派生事实在导入时会按"版本序列 + 策略历史"**重新计算
-  并比对**，保证导入后的历史结论与导出方逐条一致。
+  兼容结论。导入时会按"版本序列 + 策略历史"**重新计算并比对**。
+
+包顶层的 **`integrity`** 是对除自身外整个包做规范化（键排序、无空白）
+JSON 序列化后的 SHA-256。改动任何字段（包括 `registered_at`、
+`exported_at` 这类元数据）、截断文件、删除主体，都会让摘要对不上。
+
+### 导入前的完整性检查（全部在任何写入之前）
+
+校验顺序固定，任何一步失败都**整体拒绝、不落一条数据**：
+
+1. **完整性认证**：`integrity` 段必须存在、算法为 `SHA-256`，且重算摘要
+   逐字节一致。原始 JSON 文本无法解析（文件截断、HTTP body 被切断、
+   非 UTF-8）也在这一步拒绝；
+2. **信封结构**：`format` / `format_version` / 字段类型 / 枚举值正确；
+3. **内容齐备**：版本的 `schema`、`schema_id`、`registered_at`、`policy`、
+   `conclusion`，策略记录的 `level`、`effective_version`、`changed_at`
+   都在；策略历史必须覆盖版本 1（基线缺失则无法还原早期策略）；主体
+   不能是空壳（版本与策略都没有）；
+4. **前后一致**：版本号连续、`schema_id` 与 Schema 内容相符、记录的生效
+   策略与结论和按版本序列/策略历史的重算结果一致、策略
+   `effective_version` 不越界不倒退、Schema 文档合法。
+
+只有全部通过后才进入冲突计划与临界区应用；因此被篡改、被截断或内容不
+完整的包在真正写入前就被明确拒绝，失败时**整体回滚**（校验阶段没有任何
+变更），本次没涉及的主体也完全不动。
+
+### 异常迁移包的分类（可区分的拒绝结果）
+
+| error | HTTP | 触发阶段 | 含义 / 调用方该怎么办 |
+| --- | --- | --- | --- |
+| `BUNDLE_CORRUPT` | 400 | 认证 | 包本身不可信：JSON 无法解析/被截断、非 UTF-8、缺 `integrity`、算法未知或摘要不匹配（内容被改过）。**重新导出/重新传输**，重试同一份字节不会成功 |
+| `BUNDLE_MALFORMED` | 422 | 结构 | 包能解析且摘要正确，但信封形状不对：非对象、`format`/`format_version` 不符、字段类型错误、未知策略级别/错误码。属于**生产或搬运环节的程序问题，人工排查**后重导 |
+| `BUNDLE_INCOMPLETE` | 422 | 内容齐备 | 结构正确但**缺内容**：版本缺 `schema`/`policy`/`conclusion` 等、策略记录缺 `level`、策略历史不覆盖版本 1、主体空壳。**补齐来源数据后重新导出** |
+| `BUNDLE_INCONSISTENT` | 422 | 前后一致 | 内容完整但**自相矛盾**：版本号不连续、`schema_id` 与内容不符、记录的策略/结论与重算不符、`effective_version` 越界/倒退。需要**人工核对** |
+| `IMPORT_CONFLICT` | 409 | 计划 | 与目标实例已有数据冲突（reject 命中已有主体，或 merge 同号不同内容） |
+
+> 说明：测试里"故意改错内容后重新签名"的包会落到后三类之一（内容本身
+> 合法但矛盾/缺失）；真实场景下篡改者无法生成正确摘要，因此一律先被
+> `BUNDLE_CORRUPT` 拦下。
 
 ### 冲突与合并规则
 
@@ -177,24 +225,16 @@ Schema 使用 Avro 风格的 JSON 文档，顶层必须是 `record`：
     视为已存在，保留目标版本；
   - 版本号相同但**内容不同**：冲突，整个导入拒绝并回滚；
   - 目标缺失的版本：按原编号**追加**，编号保持连续、不重复、不跳号；
-  - 追加版本登记时的生效策略会一并补入目标策略历史（必要时在追加起点
-    注入一条等效策略记录），使 `recheck` 对新版本复现出与导出方一致的
-    结论；目标已有版本的历史结论保持目标原样。
+  - 追加版本所需的策略记录（含导出方的 `effective_version=1` 基线，以及
+    对追加区间生效的各次变更）会一并补入目标策略历史；目标已经显式登记
+    过的同 `effective_version` 记录一律保留目标原样、不被覆盖。这样即使
+    目标此前依赖自己的默认配置、且该默认与导出方不同，追加版本的
+    `recheck` 仍复现导出方的结论；目标已有版本的历史结论保持目标原样。
 - 同一份包重复导入（merge）是**幂等**的：第二次导入不产生任何新版本或
   策略记录。
-- 导入是**两阶段**的：先完整校验并对所有主体生成计划（不做任何修改），
-  再在一个临界区内整体应用。任何一步失败都整体回滚，不会留下导入到
-  一半的状态，也不会改动不在迁移集合里的主体。
-
-### 异常迁移包的分类
-
-| error | HTTP | 含义 |
-| --- | --- | --- |
-| `BUNDLE_MALFORMED` | 422 | 结构不合法：不是对象、format/format_version 不符、字段缺失或类型错误、未知策略级别 |
-| `BUNDLE_INCONSISTENT` | 422 | 结构合法但内容自相矛盾：版本号不连续、`schema_id` 与内容不符、记录的生效策略/历史结论与重算结果不一致、策略 `effective_version` 越界或倒退 |
-| `IMPORT_CONFLICT` | 409 | 与目标实例已有数据冲突（reject 模式命中已有主体，或 merge 模式同号不同内容） |
-
-三类问题都在应用前被拒绝，不会把部分数据当成功导入。
+- 导入是**两阶段**的：先认证、完整校验并对所有主体生成计划（不做任何
+  修改），再在一个临界区内整体应用。任何一步失败都整体回滚，不会留下
+  导入到一半的状态，也不会改动不在迁移集合里的主体。
 
 ### 迁移期间的并发行为
 
@@ -221,23 +261,53 @@ Schema 使用 Avro 风格的 JSON 文档，顶层必须是 `record`：
 ### 本地验证
 
 ```bash
-uv run pytest tests/test_migration.py   # 迁移专项：往返一致、冲突、幂等、并发、异常包
-uv run pytest                           # 全量回归（注册/预检/历史复现不回归）
+uv run pytest tests/test_migration.py   # 迁移专项（见下方覆盖清单）
+uv run pytest                           # 全量回归（注册/预检/历史复现/并发不回归）
 ```
 
-手动验证（两个本地实例）：
+迁移专项覆盖：
+
+- 两个**默认策略配置不同**的实例之间导出/导入（FORWARD/NONE →
+  BACKWARD）：导入不失败，逐版本策略与兼容结论与导出方一致；merge
+  场景下目标仅有部分版本、且两边默认不同时，追加版本结论仍一致；
+- 包内容被改动（`registered_at` / `exported_at` / 结论字段）、摘要伪造、
+  缺签名、JSON 被截断、非 UTF-8：全部 `BUNDLE_CORRUPT`；
+- 版本内容或策略信息缺失、策略历史不覆盖 v1：`BUNDLE_INCOMPLETE`；
+- 完整但自相矛盾（版本号不连续、`schema_id` 不符、结论/策略对不上）：
+  `BUNDLE_INCONSISTENT`；
+- 任一失败后目标实例**完全不变**（含不在迁移集合里的主体），且 reject/
+  merge 冲突、重复导入幂等、导入与注册/读取/策略调整并发均不回归。
+
+手动验证（两个默认配置不同的本地实例 + 篡改包）：
 
 ```bash
-# 实例 A（:8000）导出
+# 实例 A（默认 FORWARD）导出
+SCHEMA_REGISTRY_COMPATIBILITY=FORWARD \
+  uv run uvicorn main:app --port 8000
 curl -X POST localhost:8000/migration/export \
   -H 'content-type: application/json' \
   -d '{"subjects": ["user"]}' > bundle.json
-# 实例 B（:8001）导入（冲突整体拒绝）
+
+# 实例 B（默认 BACKWARD）导入：不依赖 B 的默认策略
+SCHEMA_REGISTRY_COMPATIBILITY=BACKWARD \
+  uv run uvicorn main:app --port 8001
 curl -X POST localhost:8001/migration/import \
   -H 'content-type: application/json' \
   -d "{\"bundle\": $(cat bundle.json), \"on_conflict\": \"reject\"}"
-# 逐版本复现核对
+# 逐版本复现核对：级别与结论和 A 完全一致
 curl localhost:8001/subjects/user/compatibility/recheck/2
+
+# 篡改登记时间后再导入 -> HTTP 400 BUNDLE_CORRUPT，目标无任何变化
+python - <<'PY'
+import json
+b = json.load(open("bundle.json"))
+b["subjects"][0]["versions"][0]["registered_at"] = "1999-01-01T00:00:00+00:00"
+json.dump({"bundle": b}, open("tampered.json", "w"))
+PY
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8001/migration/import \
+  -H 'content-type: application/json' --data @tampered.json   # 400
+# 截断的包（raw JSON 字符串形式）同样 400
+head -c 200 bundle.json > truncated.json
 ```
 
 ## 运行与验证
@@ -255,8 +325,10 @@ uv run pytest                             # 全量测试（含输入/依据/结�
   历史按当时策略复现、缓存与新版本一致性
 - `test_concurrency.py`：16 线程并发注册版本连续唯一、破坏性变更并发全拒绝、
   策略反复翻转与注册竞争后的可复现性
-- `test_migration.py`：导出导入往返一致、reject/merge 冲突处理、重复导入幂等、
-  失败整体回滚、异常迁移包分类、导入与注册/读取/策略调整并发
+- `test_migration.py`：不同默认策略实例间往返一致（含 merge 追加）、
+  包篡改/截断/缺签名拒绝、版本内容或策略信息缺失、自相矛盾四类异常分类、
+  reject/merge 冲突、重复导入幂等、失败后目标完全不变、导入与注册/读取/
+  策略调整并发
 - `test_api.py`：HTTP 端到端、409/422/404 状态码与响应体（含迁移端点）
 
 测试日志通过 `tests/conftest.py` 配置，每个关键用例打印
@@ -271,7 +343,7 @@ app/
   checker.py   纯函数：Schema 合法性校验 + 兼容性判定 + 内容指纹
   storage.py   线程安全内存存储：版本列表 + 策略历史 + 迁移快照/整体应用
   cache.py     版本感知的结论缓存
-  migration.py 纯函数：迁移包构建、校验（畸形/矛盾分类）、合并计划
+  migration.py 纯函数：迁移包构建与 SHA-256 签名、认证/结构/缺失/矛盾四级校验、合并计划
   service.py   编排：注册、预检、策略、历史复现、导出、两阶段原子导入
   api.py       FastAPI 路由与错误映射
   config.py    环境变量配置

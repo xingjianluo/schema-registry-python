@@ -134,27 +134,94 @@ def test_http_import_conflict_409(client, judge):
     assert r.json()["error"] == "IMPORT_CONFLICT"
 
 
+def test_http_import_corrupt_returns_400(client, judge):
+    """Tampered content, truncated JSON or missing signature => 400."""
+    _seed(client)
+    bundle = client.post("/migration/export",
+                         json={"subjects": ["user"]}).json()
+    import copy
+    import json as _json
+    cases = {}
+
+    tampered = copy.deepcopy(bundle)
+    tampered["subjects"][0]["versions"][0]["registered_at"] = "1999"
+    cases["tampered"] = tampered
+
+    cases["truncated-raw"] = _json.dumps(bundle)[:40]
+
+    unsigned = {k: v for k, v in bundle.items() if k != "integrity"}
+    cases["unsigned"] = unsigned
+
+    results = {}
+    for name, body in cases.items():
+        r = client.post("/migration/import",
+                        json={"bundle": body, "on_conflict": "reject"})
+        results[name] = (r.status_code, r.json().get("error"))
+    judge("http-import-400", {"cases": list(cases)},
+          "tampered/truncated/unsigned bundles are rejected before any "
+          "write with 400 BUNDLE_CORRUPT",
+          results)
+    assert all(v == (400, "BUNDLE_CORRUPT") for v in results.values())
+    # target instance completely unchanged by rejected imports
+    assert len(client.get("/subjects/user/versions").json()) == 2
+
+
 def test_http_import_malformed_and_inconsistent_422(client, judge):
     _seed(client)
     bundle = client.post("/migration/export",
                          json={"subjects": ["user"]}).json()
+    from app.migration import compute_integrity
 
-    bad_structure = client.post("/migration/import",
-                                json={"bundle": {"format": "nope"}})
-    tampered = client.post("/migration/import", json={"bundle": {
+    def reseal(b):
+        b["integrity"] = compute_integrity(b)
+        return b
+
+    bad_structure = client.post(
+        "/migration/import", json={"bundle": {"format": "nope"}})
+
+    malformed = reseal({**bundle, "format_version": 99})
+    r_malformed = client.post(
+        "/migration/import", json={"bundle": malformed})
+
+    tampered = {
         **bundle, "subjects": [
             {**bundle["subjects"][0],
              "versions": [{**bundle["subjects"][0]["versions"][0],
                            "schema_id": "0" * 16}
-                          ] + bundle["subjects"][0]["versions"][1:]}]}})
-    judge("http-import-422", {"cases": ["bad structure", "tampered id"]},
-          "structural -> BUNDLE_MALFORMED, contradiction -> "
-          "BUNDLE_INCONSISTENT, both 422",
-          {"structure": bad_structure.json(), "tampered": tampered.json()})
-    assert bad_structure.status_code == 422
-    assert bad_structure.json()["error"] == "BUNDLE_MALFORMED"
-    assert tampered.status_code == 422
-    assert tampered.json()["error"] == "BUNDLE_INCONSISTENT"
+                          ] + bundle["subjects"][0]["versions"][1:]}]}
+    # content deliberately contradicts itself, but it is properly signed so
+    # the request reaches semantic validation (otherwise it would be 400).
+    r_tampered = client.post("/migration/import",
+                             json={"bundle": reseal(tampered)})
+
+    incomplete = reseal({
+        **bundle, "subjects": [
+            {**bundle["subjects"][0],
+             "versions": [{k: v for k, v in
+                           bundle["subjects"][0]["versions"][0].items()
+                           if k != "policy"}]
+             + bundle["subjects"][0]["versions"][1:]}]})
+    r_incomplete = client.post(
+        "/migration/import", json={"bundle": incomplete})
+
+    judge("http-import-422",
+          {"cases": ["bad structure", "malformed", "tampered id",
+                     "missing policy"]},
+          "unsigned envelope -> 400; shape/type -> BUNDLE_MALFORMED; "
+          "schema_id contradiction -> BUNDLE_INCONSISTENT; missing content "
+          "-> BUNDLE_INCOMPLETE",
+          {"unsigned": bad_structure.status_code,
+           "malformed": r_malformed.json(),
+           "tampered": r_tampered.json(),
+           "incomplete": r_incomplete.json()})
+    assert bad_structure.status_code == 400
+    assert bad_structure.json()["error"] == "BUNDLE_CORRUPT"
+    assert r_malformed.status_code == 422
+    assert r_malformed.json()["error"] == "BUNDLE_MALFORMED"
+    assert r_tampered.status_code == 422
+    assert r_tampered.json()["error"] == "BUNDLE_INCONSISTENT"
+    assert r_incomplete.status_code == 422
+    assert r_incomplete.json()["error"] == "BUNDLE_INCOMPLETE"
 
 
 def test_http_export_unknown_subject_404(client):

@@ -5,6 +5,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .migration import (
+    BundleCorruptError,
+    BundleIncompleteError,
     BundleInconsistentError,
     BundleMalformedError,
     ImportConflictError,
@@ -54,8 +56,21 @@ def create_app(service: RegistryService | None = None) -> FastAPI:
         return JSONResponse(status_code=404,
                             content={"error": "NOT_FOUND", "message": str(exc)})
 
+    @app.exception_handler(BundleCorruptError)
+    async def _bundle_corrupt(request: Request, exc: BundleCorruptError):
+        # Tampered/truncated bytes: distinct 400 so callers know re-trying
+        # the same payload is hopeless; re-export / re-transfer instead.
+        return JSONResponse(status_code=400,
+                            content={"error": exc.code, "message": str(exc)})
+
     @app.exception_handler(BundleMalformedError)
     async def _bundle_malformed(request: Request, exc: BundleMalformedError):
+        return JSONResponse(status_code=422,
+                            content={"error": exc.code, "message": str(exc)})
+
+    @app.exception_handler(BundleIncompleteError)
+    async def _bundle_incomplete(request: Request,
+                                 exc: BundleIncompleteError):
         return JSONResponse(status_code=422,
                             content={"error": exc.code, "message": str(exc)})
 
@@ -144,8 +159,12 @@ def create_app(service: RegistryService | None = None) -> FastAPI:
     @app.post("/migration/import")
     def import_(payload: dict):
         bundle = payload.get("bundle")
-        if not isinstance(bundle, dict):
-            raise SchemaValidationError("body must contain a 'bundle' object")
+        # A dict is the normal JSON form; a string is treated as a raw
+        # bundle document so truncated/corrupt files get BUNDLE_CORRUPT
+        # (400) rather than a generic request error.
+        if not isinstance(bundle, (dict, str)):
+            raise SchemaValidationError(
+                "body must contain a 'bundle' object or raw JSON string")
         mode = payload.get("on_conflict", "reject")
         summary = service.import_bundle(bundle, on_conflict=mode)
         return {

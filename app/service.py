@@ -7,10 +7,12 @@ from datetime import UTC, datetime
 
 from .cache import ConclusionCache
 from .checker import canonical_schema_id, check_compatibility, validate_schema
+from .config import DEFAULT_COMPATIBILITY
 from .migration import (
     ConflictMode,
     ImportSummary,
     build_bundle,
+    parse_bundle_bytes,
     plan_import,
     validate_bundle,
 )
@@ -175,25 +177,34 @@ class RegistryService:
         if missing:
             raise KeyError(f"unknown subjects: {', '.join(sorted(missing))}")
         bundle = build_bundle(
-            snapshot, datetime.now(UTC).isoformat())
+            snapshot, datetime.now(UTC).isoformat(),
+            default_level=DEFAULT_COMPATIBILITY)
         logger.info(
-            "export subjects=%s versions=%s",
+            "export subjects=%s versions=%s default_level=%s",
             sorted(subjects),
-            {n: len(snapshot[n][0]) for n in subjects})
+            {n: len(snapshot[n][0]) for n in subjects},
+            DEFAULT_COMPATIBILITY.value)
         return bundle
 
-    def import_bundle(self, bundle: dict,
+    def import_bundle(self, bundle,
                       on_conflict: str = "reject") -> ImportSummary:
         """Import a bundle atomically.
 
-        Phase 1 (validate + plan) runs without mutating anything; any
-        malformed/inconsistent/conflicting input aborts before phase 2,
-        so there is never a half-imported state to roll back.  Phase 2
-        applies all appends in one store critical section.  The whole
-        check-then-apply is serialized against registrations and policy
-        changes via the register lock, while plain readers only ever
-        observe the state before or after the short apply.
+        *bundle* may be an already-parsed dict (HTTP JSON body) or raw
+        ``str``/``bytes`` (a bundle file/body).  Raw input that is not
+        parseable JSON -- e.g. a truncated file or cut-off HTTP body -- is
+        rejected as BUNDLE_CORRUPT before anything is read from it.
+
+        Phase 1 (authenticate + validate + plan) runs without mutating
+        anything; any corrupt/malformed/incomplete/inconsistent/conflicting
+        input aborts before phase 2, so there is never a half-imported
+        state to roll back.  Phase 2 applies all appends in one store
+        critical section.  The whole check-then-apply is serialized against
+        registrations and policy changes via the register lock, while plain
+        readers only ever observe the state before or after the short apply.
         """
+        if isinstance(bundle, (str, bytes)):
+            bundle = parse_bundle_bytes(bundle)  # -> BundleCorruptError
         entries = validate_bundle(bundle)  # raises before any mutation
         try:
             mode = ConflictMode(on_conflict)
